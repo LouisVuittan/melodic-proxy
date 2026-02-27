@@ -14,12 +14,14 @@
   "type": "commonjs",
   "description": "",
   "dependencies": {
+    "cheerio": "^1.2.0",
     "cors": "^2.8.5",
     "dotenv": "^16.6.1",
     "express": "^4.21.2",
     "youtube-caption-extractor": "^1.4.3"
   },
   "devDependencies": {
+    "@types/cheerio": "^0.22.35",
     "@types/cors": "^2.8.17",
     "@types/express": "^5.0.0",
     "@types/node": "^22.13.1",

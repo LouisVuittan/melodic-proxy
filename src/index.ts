@@ -1,5 +1,5 @@
 // proxy-server/index.ts
-// yt-dlp를 사용한 YouTube 자막 프록시 서버
+// yt-dlp와 Whisper API를 사용한 YouTube 스마트 자막 프록시 서버
 import express, { Request, Response } from "express";
 import cors from "cors";
 import { exec } from "child_process";
@@ -7,6 +7,7 @@ import { promisify } from "util";
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
+import * as cheerio from "cheerio";
 
 const execAsync = promisify(exec);
 
@@ -15,6 +16,7 @@ app.use(cors());
 app.use(express.json());
 
 const PORT = 4000;
+const WHISPER_SERVER_URL = "https://7f3e-34-168-154-170.ngrok-free.app";
 
 interface Caption {
   start: string;
@@ -22,26 +24,108 @@ interface Caption {
   text: string;
 }
 
+// ============================================
+// 유틸리티 및 보안 함수
+// ============================================
+
+// Command Injection 방지를 위한 YouTube ID 검증
+const isValidVideoId = (id: string): boolean => {
+  return /^[a-zA-Z0-9_-]{11}$/.test(id);
+};
+
+function parseJson3Captions(events: any[]): Caption[] {
+  const captions: Caption[] = [];
+  for (const event of events) {
+    if (!event.segs) continue;
+    const text = event.segs
+      .map((seg: any) => seg.utf8 || "")
+      .join("")
+      .trim();
+    if (!text) continue;
+    const startMs = event.tStartMs || 0;
+    const durationMs = event.dDurationMs || 3000;
+    captions.push({
+      start: (startMs / 1000).toFixed(3),
+      dur: (durationMs / 1000).toFixed(3),
+      text: text,
+    });
+  }
+  return captions;
+}
+
+function parseVttCaptions(vtt: string): Caption[] {
+  const captions: Caption[] = [];
+  const lines = vtt.split("\n");
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i].trim();
+    const timeMatch = line.match(
+      /(\d{2}:\d{2}:\d{2}\.\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2}\.\d{3})/,
+    );
+    if (timeMatch) {
+      const startTime = parseVttTime(timeMatch[1]);
+      const endTime = parseVttTime(timeMatch[2]);
+      i++;
+      const textLines: string[] = [];
+      while (i < lines.length && lines[i].trim() !== "") {
+        const cleanLine = lines[i].replace(/<[^>]*>/g, "").trim();
+        if (cleanLine) textLines.push(cleanLine);
+        i++;
+      }
+      const text = textLines.join(" ").trim();
+      if (text) {
+        captions.push({
+          start: startTime.toFixed(3),
+          dur: (endTime - startTime).toFixed(3),
+          text: text,
+        });
+      }
+    }
+    i++;
+  }
+  return captions;
+}
+
+function parseVttTime(time: string): number {
+  const parts = time.split(":");
+  return (
+    parseInt(parts[0], 10) * 3600 +
+    parseInt(parts[1], 10) * 60 +
+    parseFloat(parts[2])
+  );
+}
+
+// ============================================
+// 1. YouTube 자막 직접 추출 API
+// ============================================
+
 app.get(
   "/api/captions/:videoId",
   async (req: Request, res: Response): Promise<void> => {
     try {
       const { videoId } = req.params;
+
+      // 보안: 비디오 ID 검증
+      if (!isValidVideoId(videoId)) {
+        res.status(400).json({
+          success: false,
+          error: "유효하지 않은 YouTube 비디오 ID입니다.",
+        });
+        return;
+      }
+
       console.log(`Fetching captions for video: ${videoId}`);
 
       const tempDir = os.tmpdir();
       const outputPath = path.join(tempDir, `caption_${videoId}_${Date.now()}`);
 
-      // 언어 우선순위: ja → en
       const languages = ["ja", "en"];
       let subtitles: Caption[] = [];
       let usedLang = "";
 
       for (const lang of languages) {
         try {
-          // yt-dlp로 자막 다운로드 (JSON3 형식)
           const command = `yt-dlp --write-sub --sub-lang ${lang} --sub-format json3 --skip-download -o "${outputPath}" "https://www.youtube.com/watch?v=${videoId}" --no-warnings 2>&1`;
-
           console.log(`Trying language: ${lang}`);
 
           try {
@@ -53,15 +137,12 @@ app.get(
           }
 
           const jsonPath = `${outputPath}.${lang}.json3`;
-
           if (fs.existsSync(jsonPath)) {
             const jsonContent = fs.readFileSync(jsonPath, "utf-8");
             const jsonData = JSON.parse(jsonContent);
-
             if (jsonData.events && jsonData.events.length > 0) {
               subtitles = parseJson3Captions(jsonData.events);
               usedLang = lang;
-
               fs.unlinkSync(jsonPath);
               console.log(`✓ Found ${subtitles.length} captions in ${lang}`);
               break;
@@ -74,7 +155,6 @@ app.get(
             const vttContent = fs.readFileSync(vttPath, "utf-8");
             subtitles = parseVttCaptions(vttContent);
             usedLang = lang;
-
             fs.unlinkSync(vttPath);
             console.log(
               `✓ Found ${subtitles.length} captions in ${lang} (VTT)`,
@@ -99,7 +179,6 @@ app.get(
       console.log(
         `Successfully fetched ${subtitles.length} captions (${usedLang})`,
       );
-
       res.json({
         success: true,
         data: subtitles,
@@ -116,84 +195,8 @@ app.get(
   },
 );
 
-function parseJson3Captions(events: any[]): Caption[] {
-  const captions: Caption[] = [];
-
-  for (const event of events) {
-    if (!event.segs) continue;
-
-    const text = event.segs
-      .map((seg: any) => seg.utf8 || "")
-      .join("")
-      .trim();
-
-    if (!text) continue;
-
-    const startMs = event.tStartMs || 0;
-    const durationMs = event.dDurationMs || 3000;
-
-    captions.push({
-      start: (startMs / 1000).toFixed(3),
-      dur: (durationMs / 1000).toFixed(3),
-      text: text,
-    });
-  }
-
-  return captions;
-}
-
-function parseVttCaptions(vtt: string): Caption[] {
-  const captions: Caption[] = [];
-  const lines = vtt.split("\n");
-
-  let i = 0;
-  while (i < lines.length) {
-    const line = lines[i].trim();
-
-    const timeMatch = line.match(
-      /(\d{2}:\d{2}:\d{2}\.\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2}\.\d{3})/,
-    );
-
-    if (timeMatch) {
-      const startTime = parseVttTime(timeMatch[1]);
-      const endTime = parseVttTime(timeMatch[2]);
-
-      i++;
-      const textLines: string[] = [];
-      while (i < lines.length && lines[i].trim() !== "") {
-        const cleanLine = lines[i].replace(/<[^>]*>/g, "").trim();
-        if (cleanLine) {
-          textLines.push(cleanLine);
-        }
-        i++;
-      }
-
-      const text = textLines.join(" ").trim();
-      if (text) {
-        captions.push({
-          start: startTime.toFixed(3),
-          dur: (endTime - startTime).toFixed(3),
-          text: text,
-        });
-      }
-    }
-
-    i++;
-  }
-
-  return captions;
-}
-
-function parseVttTime(time: string): number {
-  const parts = time.split(":");
-  const hours = parseInt(parts[0], 10);
-  const minutes = parseInt(parts[1], 10);
-  const seconds = parseFloat(parts[2]);
-  return hours * 3600 + minutes * 60 + seconds;
-}
-
 // ============================================
-// Uta-Net 가사 API (J-POP 전용)
+// 2. Uta-Net 가사 API (J-POP 전용) - Cheerio 적용
 // ============================================
 
 app.get("/api/lyrics", async (req: Request, res: Response): Promise<void> => {
@@ -201,106 +204,76 @@ app.get("/api/lyrics", async (req: Request, res: Response): Promise<void> => {
     const { artist, title } = req.query;
 
     if (!artist || !title) {
-      res.status(400).json({
-        success: false,
-        error: "artist와 title 파라미터 필요",
-      });
+      res
+        .status(400)
+        .json({ success: false, error: "artist와 title 파라미터 필요" });
       return;
     }
 
     console.log(`Uta-Net 가사 검색: 아티스트(${artist}) - 곡명(${title})`);
-
     const searchTitle = title as string;
     const searchUrl = `https://www.uta-net.com/search/?Keyword=${encodeURIComponent(searchTitle)}&x=0&y=0`;
-
     console.log(`검색 URL: ${searchUrl}`);
 
-    const searchResponse = await fetch(searchUrl, {
+    let searchResponse = await fetch(searchUrl, {
       headers: {
-        "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        Accept:
-          "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-        "Accept-Language": "ja-JP,ja;q=0.9,en;q=0.8",
-        "Accept-Encoding": "gzip, deflate, br",
-        Connection: "keep-alive",
+        "User-Agent": "Mozilla/5.0",
+        "Accept-Language": "ja-JP,ja;q=0.9",
       },
     });
 
     console.log(`검색 응답 상태: ${searchResponse.status}`);
 
+    // 원래 있던 대체 검색(Fallback) 로직 복구
     if (!searchResponse.ok) {
       const altSearchUrl = `https://www.uta-net.com/user/index_search/search2.html?md=&st=title&kw=${encodeURIComponent(searchTitle)}`;
       console.log(`대체 검색 URL 시도: ${altSearchUrl}`);
-
-      const altResponse = await fetch(altSearchUrl, {
+      searchResponse = await fetch(altSearchUrl, {
         headers: {
-          "User-Agent":
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+          "User-Agent": "Mozilla/5.0",
           "Accept-Language": "ja-JP,ja;q=0.9",
         },
       });
-
-      if (!altResponse.ok) {
-        throw new Error(`Uta-Net 검색 실패: ${altResponse.status}`);
-      }
+      if (!searchResponse.ok)
+        throw new Error(`Uta-Net 검색 실패: ${searchResponse.status}`);
     }
 
     const searchHtml = await searchResponse.text();
     console.log(`검색 결과 HTML 길이: ${searchHtml.length}`);
 
+    const $ = cheerio.load(searchHtml);
     let songUrl: string | null = null;
 
-    // 🔥 핵심 수정 사항: 정규식을 더욱 강력하게 변경했습니다.
-    // <a> 태그 내부에 <span> 등 다른 태그가 포함되어 있어도 무시하고 추출하며,
-    // 곡 링크 다음에 나오는 아티스트 링크를 정확하게 묶어서 가져옵니다.
-    const songPattern =
-      /href="(\/song\/\d+\/)"[^>]*>([\s\S]*?)<\/a>(?:(?!href="\/song\/)[\s\S])*?href="\/artist\/\d+\/"[^>]*>([\s\S]*?)<\/a>/g;
-
-    const artistLower = (artist as string).toLowerCase();
-    const artistNormalized = artistLower.replace(
-      /[^a-z0-9\u3040-\u309f\u30a0-\u30ff\u4e00-\u9faf]/g,
-      "",
-    );
-
-    let match;
     const candidates: { url: string; title: string; artist: string }[] = [];
 
-    // HTML 엔티티를 텍스트로 디코딩하는 헬퍼
-    const decodeHtml = (html: string) => {
-      return html
-        .replace(/&amp;/g, "&")
-        .replace(/&lt;/g, "<")
-        .replace(/&gt;/g, ">")
-        .replace(/&quot;/g, '"')
-        .replace(/&#39;/g, "'")
-        .replace(/&nbsp;/g, " ");
-    };
-
-    while ((match = songPattern.exec(searchHtml)) !== null) {
-      // 캡처한 HTML에서 태그를 전부 날려버리고 순수 텍스트만 남김
-      const rawTitle = decodeHtml(match[2].replace(/<[^>]*>/g, "")).trim();
-      const rawArtist = decodeHtml(match[3].replace(/<[^>]*>/g, "")).trim();
-
-      if (rawTitle && rawArtist) {
-        candidates.push({
-          url: match[1],
-          title: rawTitle,
-          artist: rawArtist,
-        });
+    // Cheerio를 이용한 우타넷 검색 결과 테이블 파싱
+    $('a[href^="/song/"]').each((_, el) => {
+      const url = $(el).attr("href");
+      const rawTitle = $(el).text().trim();
+      const rawArtist = $(el)
+        .closest("tr")
+        .find('a[href^="/artist/"]')
+        .text()
+        .trim();
+      if (url && rawTitle && rawArtist) {
+        candidates.push({ url, title: rawTitle, artist: rawArtist });
       }
-    }
-
-    console.log(`검색 결과 후보: ${candidates.length}개`);
-    candidates.forEach((c, i) => {
-      console.log(`  후보 ${i + 1}: ${c.title} - ${c.artist}`);
     });
 
+    console.log(`검색 결과 후보: ${candidates.length}개`);
+    candidates.forEach((c, i) =>
+      console.log(`  후보 ${i + 1}: ${c.title} - ${c.artist}`),
+    );
+
+    const artistNormalized = (artist as string)
+      .toLowerCase()
+      .replace(/[^a-z0-9\u3040-\u309f\u30a0-\u30ff\u4e00-\u9faf]/g, "");
+
+    // 아티스트 매칭
     for (const candidate of candidates) {
       const candArtist = candidate.artist
         .toLowerCase()
         .replace(/[^a-z0-9\u3040-\u309f\u30a0-\u30ff\u4e00-\u9faf]/g, "");
-
       if (
         candArtist.includes(artistNormalized) ||
         artistNormalized.includes(candArtist) ||
@@ -315,8 +288,9 @@ app.get("/api/lyrics", async (req: Request, res: Response): Promise<void> => {
       }
     }
 
+    // 아티스트 매칭 실패 시 제목으로 매칭 시도
     if (!songUrl) {
-      const titleLower = (title as string).toLowerCase();
+      const titleLower = searchTitle.toLowerCase();
       for (const candidate of candidates) {
         const candTitle = candidate.title.toLowerCase();
         if (candTitle.includes(titleLower) || titleLower.includes(candTitle)) {
@@ -337,23 +311,15 @@ app.get("/api/lyrics", async (req: Request, res: Response): Promise<void> => {
     }
 
     console.log(`최종 곡 URL 발견: ${songUrl}`);
-
     const result = await scrapeUtaNet(songUrl);
 
     if (!result) {
-      res.status(404).json({
-        success: false,
-        error: "가사 스크래핑 실패",
-      });
+      res.status(404).json({ success: false, error: "가사 스크래핑 실패" });
       return;
     }
 
     console.log(`가사 로드 완료: ${result.lyrics.length}자`);
-
-    res.json({
-      success: true,
-      data: result,
-    });
+    res.json({ success: true, data: result });
   } catch (error) {
     console.error("Uta-Net API 에러:", error);
     res.status(500).json({
@@ -371,94 +337,38 @@ async function scrapeUtaNet(url: string): Promise<{
 } | null> {
   try {
     console.log(`가사 페이지 요청: ${url}`);
-
     const response = await fetch(url, {
       headers: {
-        "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        Accept:
-          "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-        "Accept-Language": "ja-JP,ja;q=0.9,en;q=0.8",
+        "User-Agent": "Mozilla/5.0",
+        "Accept-Language": "ja-JP,ja;q=0.9",
       },
     });
-
-    if (!response.ok) {
-      throw new Error(`페이지 로드 실패: ${response.status}`);
-    }
+    if (!response.ok) throw new Error(`페이지 로드 실패: ${response.status}`);
 
     const html = await response.text();
+    const $ = cheerio.load(html);
 
-    let title = "";
-    const titleMatch1 = html.match(/<h2[^>]*>([^<]+)<\/h2>/);
-    const titleMatch2 = html.match(
-      /class="[^"]*song-title[^"]*"[^>]*>([^<]+)</,
-    );
-    const titleMatch3 = html.match(/<title>([^<]+?)[\s\|]/);
-    title = (
-      titleMatch1?.[1] ||
-      titleMatch2?.[1] ||
-      titleMatch3?.[1] ||
-      ""
-    ).trim();
+    const title =
+      $("h2").first().text().trim() || $(".song-title").first().text().trim();
+    const artist =
+      $('[itemprop="byArtist"]').first().text().trim() ||
+      $(".artist a").first().text().trim();
 
-    let artist = "";
-    const artistMatch1 = html.match(/itemprop="byArtist"[^>]*>([^<]+)</);
-    const artistMatch2 = html.match(
-      /class="[^"]*artist[^"]*"[^>]*><a[^>]*>([^<]+)</,
-    );
-    const artistMatch3 = html.match(/<h3[^>]*>[\s\S]*?<a[^>]*>([^<]+)<\/a>/);
-    artist = (
-      artistMatch1?.[1] ||
-      artistMatch2?.[1] ||
-      artistMatch3?.[1] ||
-      ""
-    ).trim();
-
-    let lyrics = "";
-    const lyricsMatch = html.match(
-      /<div[^>]*id="kashi_area"[^>]*>([\s\S]*?)<\/div>/,
-    );
-
-    if (lyricsMatch) {
-      lyrics = lyricsMatch[1];
-    } else {
-      const altMatch = html.match(/itemprop="lyrics"[^>]*>([\s\S]*?)<\/div>/);
-      if (altMatch) {
-        lyrics = altMatch[1];
-      }
-    }
-
-    if (!lyrics) {
+    let lyricsHtml = $("#kashi_area").html() || $('[itemprop="lyrics"]').html();
+    if (!lyricsHtml) {
       console.error("가사 영역을 찾을 수 없음");
       return null;
     }
 
-    lyrics = lyrics.replace(/<br\s*\/?>/gi, "\n");
-    lyrics = lyrics.replace(/<[^>]*>/g, "");
-    lyrics = lyrics
-      .replace(/&amp;/g, "&")
-      .replace(/&lt;/g, "<")
-      .replace(/&gt;/g, ">")
-      .replace(/&quot;/g, '"')
-      .replace(/&#39;/g, "'")
-      .replace(/&nbsp;/g, " ")
-      .trim();
+    lyricsHtml = lyricsHtml.replace(/<br\s*\/?>/gi, "\n");
+    const $lyrics = cheerio.load(lyricsHtml);
+    let lyrics = $lyrics.root().text().trim(); // .root() 를 추가!
     lyrics = lyrics.replace(/\n{3,}/g, "\n\n");
 
     console.log(
       `추출 완료 - 제목: ${title}, 아티스트: ${artist}, 가사길이: ${lyrics.length}`,
     );
-
-    if (!lyrics) {
-      return null;
-    }
-
-    return {
-      title,
-      artist,
-      lyrics,
-      url,
-    };
+    return lyrics ? { title, artist, lyrics, url } : null;
   } catch (error) {
     console.error("Uta-Net 스크래핑 에러:", error);
     return null;
@@ -466,7 +376,7 @@ async function scrapeUtaNet(url: string): Promise<{
 }
 
 // ============================================
-// 스마트 자막 API (YouTube 자막 없으면 Aeneas 사용)
+// 3. 스마트 자막 API (YouTube 자막 없으면 Whisper 사용)
 // ============================================
 
 app.get(
@@ -474,6 +384,15 @@ app.get(
   async (req: Request, res: Response): Promise<void> => {
     try {
       const { videoId } = req.params;
+
+      if (!isValidVideoId(videoId)) {
+        res.status(400).json({
+          success: false,
+          error: "유효하지 않은 YouTube 비디오 ID입니다.",
+        });
+        return;
+      }
+
       const artist = req.query.artist as string;
       const title = req.query.title as string;
       const language = (req.query.language as string) || "ja";
@@ -483,10 +402,9 @@ app.get(
       console.log(`아티스트: ${artist}, 곡명: ${title}`);
       console.log(`========================================`);
 
-      // 1. YouTube 자막 먼저 시도
+      // [1단계] YouTube 자막 체크
       console.log(`\n[1단계] YouTube 자막 체크...`);
       const youtubeResult = await fetchYouTubeCaptions(videoId);
-
       if (youtubeResult.success && youtubeResult.captions.length > 0) {
         console.log(`✅ YouTube 자막 발견! ${youtubeResult.captions.length}개`);
         res.json({
@@ -500,8 +418,6 @@ app.get(
       }
 
       console.log(`❌ YouTube 자막 없음`);
-
-      // 2. Uta-Net 가사 가져오기
       if (!artist || !title) {
         res.status(400).json({
           success: false,
@@ -510,45 +426,54 @@ app.get(
         return;
       }
 
+      // [2단계] Uta-Net 가사 가져오기
       console.log(`\n[2단계] Uta-Net 가사 가져오기...`);
-      const lyricsResult = await fetchUtaNetLyrics(artist, title);
+      const searchUrl = `http://localhost:${PORT}/api/lyrics?artist=${encodeURIComponent(artist)}&title=${encodeURIComponent(title)}`;
+      const lyricsResponse = await fetch(searchUrl);
+      const lyricsData = await lyricsResponse.json();
 
-      if (!lyricsResult.success || !lyricsResult.lyrics) {
-        res.status(404).json({
-          success: false,
-          error: "가사를 찾을 수 없음",
-        });
+      if (!lyricsData.success || !lyricsData.data || !lyricsData.data.lyrics) {
+        res.status(404).json({ success: false, error: "가사를 찾을 수 없음" });
         return;
       }
 
-      console.log(`✅ 가사 발견! ${lyricsResult.lyrics.length}자`);
+      const lyricsText = lyricsData.data.lyrics;
+      console.log(`✅ 가사 발견! ${lyricsText.length}자`);
 
-      // 3. Aeneas로 Forced Alignment (가사 + 오디오 → 타임스탬프)
-      console.log(`\n[3단계] Aeneas Forced Alignment...`);
-      const whisperResult = await fetchWhisperAlignment(
-        videoId,
-        lyricsResult.lyrics, // 가사 전달!
-        language,
-      );
+      // [3단계] Whisper Forced Alignment
+      console.log(`\n[3단계] Whisper Forced Alignment...`);
+      const whisperResponse = await fetch(`${WHISPER_SERVER_URL}/api/align`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "ngrok-skip-browser-warning": "true", // 👈 이 암구호를 꼭 추가해 주세요!
+        },
+        body: JSON.stringify({
+          video_id: videoId,
+          lyrics: lyricsText,
+          language,
+        }),
+      });
 
-      if (!whisperResult.success || whisperResult.segments.length === 0) {
-        res.status(500).json({
-          success: false,
-          error: "Aeneas 처리 실패",
-        });
+      const whisperResult = await whisperResponse.json();
+
+      if (
+        !whisperResult.success ||
+        !whisperResult.segments ||
+        whisperResult.segments.length === 0
+      ) {
+        res.status(500).json({ success: false, error: "Whisper 처리 실패" });
         return;
       }
 
       console.log(
-        `✅ Aeneas 완료! ${whisperResult.segments.length}개 세그먼트`,
+        `✅ Whisper 완료! ${whisperResult.segments.length}개 세그먼트`,
       );
-
-      // 4. 결과 반환 (이미 가사 + 타임스탬프 조합됨)
       console.log(`\n[4단계] 완료!`);
 
       res.json({
         success: true,
-        source: "whisperx",
+        source: "whisper",
         data: whisperResult.segments.map((seg: any) => ({
           start: seg.start.toString(),
           dur: (seg.end - seg.start).toFixed(3),
@@ -567,244 +492,97 @@ app.get(
   },
 );
 
-// YouTube 자막 가져오기 (내부 함수)
-async function fetchYouTubeCaptions(videoId: string): Promise<{
-  success: boolean;
-  captions: Caption[];
-  lang: string;
-}> {
+async function fetchYouTubeCaptions(
+  videoId: string,
+): Promise<{ success: boolean; captions: Caption[]; lang: string }> {
   const tempDir = os.tmpdir();
   const outputPath = path.join(tempDir, `caption_${videoId}_${Date.now()}`);
-  const languages = ["ja", "en"];
 
-  for (const lang of languages) {
+  try {
+    // 1. 현재 영상에 존재하는 모든 자막 리스트를 먼저 출력해봅니다.
+    // --- 여기부터 추가 ---
     try {
-      const command = `yt-dlp --write-sub --sub-lang ${lang} --sub-format json3 --skip-download -o "${outputPath}" "https://www.youtube.com/watch?v=${videoId}" --no-warnings 2>&1`;
+      console.log(`\n[검토] 영상(${videoId}) 자막 리스트 확인...`);
+      // --list-subs 옵션은 실제로 다운로드하지 않고 영상의 자막 목록만 표로 보여줍니다.
+      const { stdout: subList } = await execAsync(
+        `yt-dlp --list-subs "https://www.youtube.com/watch?v=${videoId}"`,
+      );
+      console.log("================ YouTube Subtitle List ================");
+      console.log(subList);
+      console.log("=======================================================");
+    } catch (listError) {
+      console.log(
+        "[경고] 자막 리스트를 불러올 수 없습니다. (영상 삭제 혹은 차단 등)",
+      );
+    }
+    // 2. 자막 추출 시도 (자동 생성 자막까지 포함하도록 옵션 강화)
+    // --write-auto-sub: 자동 생성 자막 허용
+    for (const lang of ["ja"]) {
+      console.log(`[시도] ${lang} 자막 다운로드 시도 중...`);
+      // index.ts 수정 제안
+      const command = `yt-dlp --write-sub --all-subs --sub-format json3/vtt --skip-download \
+  --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
+  --extractor-args "youtube:player_client=android,web" \
+  -o "${outputPath}" "https://www.youtube.com/watch?v=${videoId}"`;
 
       try {
         await execAsync(command, { timeout: 30000 });
       } catch (e) {
-        // yt-dlp 출력 무시
+        // 에러 발생 시 로그 출력
+        console.log(
+          `${lang} 추출 중 에러 발생(무시하고 다음 단계 진행):`,
+          (e as any).message,
+        );
       }
 
       const jsonPath = `${outputPath}.${lang}.json3`;
-
       if (fs.existsSync(jsonPath)) {
-        const jsonContent = fs.readFileSync(jsonPath, "utf-8");
-        const jsonData = JSON.parse(jsonContent);
-
-        if (jsonData.events && jsonData.events.length > 0) {
-          const captions = parseJson3Captions(jsonData.events);
-          fs.unlinkSync(jsonPath);
+        const captions = parseJson3Captions(
+          JSON.parse(fs.readFileSync(jsonPath, "utf-8")).events || [],
+        );
+        if (captions.length > 0) {
+          fs.unlinkSync(jsonPath); // 사용 후 삭제
           return { success: true, captions, lang };
         }
-        fs.unlinkSync(jsonPath);
       }
 
+      // VTT 파일 체크 로직 (생략 가능하나 유지)
       const vttPath = `${outputPath}.${lang}.vtt`;
       if (fs.existsSync(vttPath)) {
-        const vttContent = fs.readFileSync(vttPath, "utf-8");
-        const captions = parseVttCaptions(vttContent);
+        const captions = parseVttCaptions(fs.readFileSync(vttPath, "utf-8"));
         fs.unlinkSync(vttPath);
-        return { success: true, captions, lang };
+        if (captions.length > 0) return { success: true, captions, lang };
       }
-    } catch (e) {
-      continue;
     }
+  } catch (globalError) {
+    console.error("자막 체크 중 치명적 오류:", globalError);
   }
 
   return { success: false, captions: [], lang: "" };
 }
 
-// Uta-Net 가사 가져오기 (내부 함수)
-async function fetchUtaNetLyrics(
-  artist: string,
-  title: string,
-): Promise<{
-  success: boolean;
-  lyrics: string;
-  songTitle: string;
-  songArtist: string;
-}> {
-  try {
-    const searchUrl = `https://www.uta-net.com/search/?Keyword=${encodeURIComponent(title)}&x=0&y=0`;
-
-    const searchResponse = await fetch(searchUrl, {
-      headers: {
-        "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Accept-Language": "ja-JP,ja;q=0.9",
-      },
-    });
-
-    if (!searchResponse.ok) {
-      return { success: false, lyrics: "", songTitle: "", songArtist: "" };
-    }
-
-    const searchHtml = await searchResponse.text();
-
-    const songPattern =
-      /href="(\/song\/\d+\/)"[^>]*>([\s\S]*?)<\/a>(?:(?!href="\/song\/)[\s\S])*?href="\/artist\/\d+\/"[^>]*>([\s\S]*?)<\/a>/g;
-
-    const decodeHtml = (html: string) => {
-      return html
-        .replace(/&amp;/g, "&")
-        .replace(/&lt;/g, "<")
-        .replace(/&gt;/g, ">")
-        .replace(/&quot;/g, '"')
-        .replace(/&#39;/g, "'")
-        .replace(/&nbsp;/g, " ");
-    };
-
-    const artistLower = artist.toLowerCase();
-    const artistNormalized = artistLower.replace(
-      /[^a-z0-9\u3040-\u309f\u30a0-\u30ff\u4e00-\u9faf]/g,
-      "",
-    );
-
-    let match;
-    while ((match = songPattern.exec(searchHtml)) !== null) {
-      const rawArtist = decodeHtml(match[3].replace(/<[^>]*>/g, "")).trim();
-      const candArtist = rawArtist
-        .toLowerCase()
-        .replace(/[^a-z0-9\u3040-\u309f\u30a0-\u30ff\u4e00-\u9faf]/g, "");
-
-      if (
-        candArtist.includes(artistNormalized) ||
-        artistNormalized.includes(candArtist) ||
-        rawArtist.includes(artist) ||
-        artist.includes(rawArtist)
-      ) {
-        const songUrl = `https://www.uta-net.com${match[1]}`;
-        const result = await scrapeUtaNet(songUrl);
-
-        if (result) {
-          return {
-            success: true,
-            lyrics: result.lyrics,
-            songTitle: result.title,
-            songArtist: result.artist,
-          };
-        }
-      }
-    }
-
-    return { success: false, lyrics: "", songTitle: "", songArtist: "" };
-  } catch (error) {
-    console.error("Uta-Net 에러:", error);
-    return { success: false, lyrics: "", songTitle: "", songArtist: "" };
-  }
-}
-
-// Aeneas Forced Alignment (가사 + 오디오)
-async function fetchWhisperAlignment(
-  videoId: string,
-  lyrics: string,
-  language: string,
-): Promise<{
-  success: boolean;
-  segments: { text: string; start: number; end: number }[];
-}> {
-  try {
-    const response = await fetch(`${ALIGNMENT_SERVER_URL}/api/align`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        video_id: videoId,
-        lyrics: lyrics,
-        language,
-      }),
-    });
-
-    const data = await response.json();
-
-    if (data.success && data.segments) {
-      return { success: true, segments: data.segments };
-    }
-
-    return { success: false, segments: [] };
-  } catch (error) {
-    console.error("Aeneas Alignment 에러:", error);
-    return { success: false, segments: [] };
-  }
-}
-
-// Aeneas 타임스탬프 가져오기 (내부 함수)
-async function fetchWhisperTimestamps(
-  videoId: string,
-  language: string,
-): Promise<{
-  success: boolean;
-  segments: { text: string; start: number; end: number }[];
-}> {
-  try {
-    const response = await fetch(`${ALIGNMENT_SERVER_URL}/api/transcribe`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ video_id: videoId, language }),
-    });
-
-    const data = await response.json();
-
-    if (data.success && data.segments) {
-      return { success: true, segments: data.segments };
-    }
-
-    return { success: false, segments: [] };
-  } catch (error) {
-    console.error("Aeneas 에러:", error);
-    return { success: false, segments: [] };
-  }
-}
-
-// 가사와 타임스탬프 조합
-function combineLyricsWithTimestamps(
-  lyrics: string,
-  segments: { text: string; start: number; end: number }[],
-): Caption[] {
-  // Aeneas 결과를 그대로 Caption 형식으로 변환
-  // TODO: 실제 가사와 매칭하는 고급 로직 추가 가능
-
-  return segments.map((seg) => ({
-    start: seg.start.toFixed(3),
-    dur: (seg.end - seg.start).toFixed(3),
-    text: seg.text,
-  }));
-}
-
 // ============================================
-// Aeneas 연동 API
+// 4. Whisper 연동 API (Proxy)
 // ============================================
-
-const ALIGNMENT_SERVER_URL =
-  process.env.ALIGNMENT_SERVER_URL || "http://localhost:5000";
 
 app.post(
   "/api/whisper/transcribe",
   async (req: Request, res: Response): Promise<void> => {
     try {
       const { video_id, language = "ja" } = req.body;
-
-      if (!video_id) {
-        res.status(400).json({
-          success: false,
-          error: "video_id 필요",
-        });
+      if (!video_id || !isValidVideoId(video_id)) {
+        res.status(400).json({ success: false, error: "올바른 video_id 필요" });
         return;
       }
-
-      console.log(`Aeneas transcribe: ${video_id} (${language})`);
-
-      const response = await fetch(`${ALIGNMENT_SERVER_URL}/api/transcribe`, {
+      console.log(`Whisper transcribe: ${video_id} (${language})`);
+      const response = await fetch(`${WHISPER_SERVER_URL}/api/transcribe`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ video_id, language }),
       });
-
-      const data = await response.json();
-      res.json(data);
+      res.json(await response.json());
     } catch (error) {
-      console.error("Aeneas 에러:", error);
+      console.error("Whisper 에러:", error);
       res.status(500).json({
         success: false,
         error: error instanceof Error ? error.message : "Unknown error",
@@ -818,27 +596,21 @@ app.post(
   async (req: Request, res: Response): Promise<void> => {
     try {
       const { video_id, lyrics, language = "ja" } = req.body;
-
-      if (!video_id || !lyrics) {
-        res.status(400).json({
-          success: false,
-          error: "video_id와 lyrics 필요",
-        });
+      if (!video_id || !isValidVideoId(video_id) || !lyrics) {
+        res
+          .status(400)
+          .json({ success: false, error: "올바른 video_id와 lyrics 필요" });
         return;
       }
-
-      console.log(`Aeneas align: ${video_id}`);
-
-      const response = await fetch(`${ALIGNMENT_SERVER_URL}/api/align`, {
+      console.log(`Whisper align: ${video_id}`);
+      const response = await fetch(`${WHISPER_SERVER_URL}/api/align`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ video_id, lyrics, language }),
       });
-
-      const data = await response.json();
-      res.json(data);
+      res.json(await response.json());
     } catch (error) {
-      console.error("Aeneas 에러:", error);
+      console.error("Whisper 에러:", error);
       res.status(500).json({
         success: false,
         error: error instanceof Error ? error.message : "Unknown error",
@@ -850,5 +622,5 @@ app.post(
 app.listen(PORT, () => {
   console.log(`Proxy server running on port ${PORT}`);
   console.log(`Using yt-dlp for caption extraction`);
-  console.log(`Aeneas URL: ${ALIGNMENT_SERVER_URL}`);
+  console.log(`Whisper Server URL: ${WHISPER_SERVER_URL}`);
 });
